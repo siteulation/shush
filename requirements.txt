@@ -6,3 +6,4 @@ discord.py[voice]
 discord-ext-voice-recv
 PyNaCl
 flask-socketio
+numpy

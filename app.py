@@ -7,57 +7,105 @@ from discord.ext import commands
 
 # 1. Setup Discord Bot
 intents = discord.Intents.default()
+intents.guilds = True
 intents.messages = True
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Global queue to store messages for the web UI
 message_log = []
-
-@bot.event
-async def on_ready():
-    print(f'Logged in as {bot.user}')
 
 @bot.event
 async def on_message(message):
     if message.author == bot.user:
         return
-    # Store incoming Discord messages to show on the web
-    message_log.append(f"Discord - {message.author}: {message.content}")
-    await bot.process_commands(message)
+    # Log messages with Context
+    log_entry = f"[{message.guild.name} # {message.channel.name}] {message.author}: {message.content}"
+    message_log.append(log_entry)
 
-# 2. Setup Flask Web Server
+# 2. Flask Application
 app = Flask(__name__)
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
-<head><title>Discord Bridge</title></head>
+<head>
+    <title>Discord Multi-Server Bridge</title>
+    <style>
+        body { font-family: sans-serif; margin: 20px; background: #f4f4f4; }
+        #log { border: 1px solid #ccc; height: 300px; overflow-y: scroll; background: white; padding: 10px; margin-top: 10px; }
+        .controls { background: white; padding: 15px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+    </style>
+</head>
 <body>
-    <h2>Send to Discord</h2>
-    <input type="text" id="msg" placeholder="Type something...">
-    <button onclick="sendMsg()">Send</button>
-    
-    <h2>Live Chat Log</h2>
-    <div id="log" style="border:1px solid #ccc; height:200px; overflow-y:scroll;"></div>
+    <div class="controls">
+        <h2>Discord Controller</h2>
+        
+        <label>Select Server:</label>
+        <select id="guild_select" onchange="updateChannels()">
+            <option value="">-- Choose a Server --</option>
+        </select>
+
+        <label>Select Channel:</label>
+        <select id="channel_select">
+            <option value="">-- Choose a Channel --</option>
+        </select>
+        <br><br>
+        <input type="text" id="msg" style="width: 70%" placeholder="Type a message...">
+        <button onclick="sendMsg()">Send</button>
+    </div>
+
+    <h3>Live Activity Feed</h3>
+    <div id="log"></div>
 
     <script>
-        async def sendMsg() {
-            const val = document.getElementById('msg').value;
+        // Fetch Guilds on Load
+        async function loadGuilds() {
+            const res = await fetch('/get_guilds');
+            const guilds = await res.json();
+            const select = document.getElementById('guild_select');
+            guilds.forEach(g => {
+                let opt = document.createElement('option');
+                opt.value = g.id;
+                opt.innerHTML = g.name;
+                select.appendChild(opt);
+            });
+        }
+
+        // Fetch Channels when Guild changes
+        async function updateChannels() {
+            const guildId = document.getElementById('guild_select').value;
+            const res = await fetch(`/get_channels/${guildId}`);
+            const channels = await res.json();
+            const select = document.getElementById('channel_select');
+            select.innerHTML = '';
+            channels.forEach(c => {
+                let opt = document.createElement('option');
+                opt.value = c.id;
+                opt.innerHTML = "# " + c.name;
+                select.appendChild(opt);
+            });
+        }
+
+        async function sendMsg() {
+            const channelId = document.getElementById('channel_select').value;
+            const text = document.getElementById('msg').value;
+            if(!channelId || !text) return alert("Select a channel and type a message!");
+
             await fetch('/send', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({message: val})
+                body: JSON.stringify({channel_id: channelId, message: text})
             });
             document.getElementById('msg').value = '';
         }
 
-        // Poll for new messages every 2 seconds
         setInterval(async () => {
             const res = await fetch('/messages');
             const data = await res.json();
-            document.getElementById('log').innerHTML = data.join('<br>');
+            document.getElementById('log').innerHTML = data.slice().reverse().join('<br>');
         }, 2000);
+
+        window.onload = loadGuilds;
     </script>
 </body>
 </html>
@@ -67,14 +115,30 @@ HTML_TEMPLATE = """
 def index():
     return render_template_string(HTML_TEMPLATE)
 
+@app.route('/get_guilds')
+def get_guilds():
+    # Returns list of servers the bot is in
+    guilds = [{"id": str(g.id), "name": g.name} for g in bot.guilds]
+    return jsonify(guilds)
+
+@app.route('/get_channels/<guild_id>')
+def get_channels(guild_id):
+    guild = bot.get_guild(int(guild_id))
+    if not guild: return jsonify([])
+    # Only return text channels the bot can actually send messages to
+    channels = [{"id": str(c.id), "name": c.name} for c in guild.text_channels]
+    return jsonify(channels)
+
 @app.route('/send', methods=['POST'])
 def send_to_discord():
-    user_text = request.json.get('message')
-    if user_text:
-        message_log.append(f"Web: {user_text}")
-        # Send to a specific channel (replace CHANNEL_ID with your actual ID)
-        channel = bot.get_channel(1234567890) 
+    data = request.json
+    channel_id = data.get('channel_id')
+    user_text = data.get('message')
+    
+    if channel_id and user_text:
+        channel = bot.get_channel(int(channel_id))
         if channel:
+            message_log.append(f"Web -> #{channel.name}: {user_text}")
             bot.loop.create_task(channel.send(user_text))
     return jsonify(success=True)
 
@@ -82,12 +146,9 @@ def send_to_discord():
 def get_messages():
     return jsonify(message_log)
 
-# 3. Run both systems
 def run_flask():
     app.run(host='0.0.0.0', port=5000)
 
 if __name__ == "__main__":
-    # Start Flask in a separate thread
-    threading.Thread(target=run_flask).start()
-    # Start Discord Bot
+    threading.Thread(target=run_flask, daemon=True).start()
     bot.run(os.getenv('APITOK'))

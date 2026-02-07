@@ -17,20 +17,23 @@ intents.voice_states = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 app = Flask(__name__)
-socketio = SocketIO(app, cors_allowed_origins="*")
+# Using eventlet or gevent is recommended for production SocketIO, 
+# but for a direct script, we'll stick to the standard threading mode.
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
 bot_loop = None
 vc_client = None
 
-# --- DISCORD RECEIVE AUDIO ---
+# --- AUDIO SINK ---
 class BrowserAudioSink(voice_recv.AudioSink):
     def want_opus(self):
-        return False # We want PCM to send to browser easily
+        return False # Convert to PCM for browser
 
     def write(self, user, data):
-        # Send raw audio bytes to the browser via WebSocket
-        socketio.emit('audio_data', {'user': str(user), 'data': data.pcm})
+        # Emit raw PCM data to the browser
+        socketio.emit('audio_stream', {'data': data.pcm})
 
+# --- DISCORD EVENTS ---
 @bot.event
 async def on_ready():
     global bot_loop
@@ -41,7 +44,17 @@ async def on_ready():
 async def on_message(message):
     if message.author == bot.user or message.channel.id != TEXT_CHANNEL_ID:
         return
-    socketio.emit('text_message', {'user': message.author.display_name, 'content': message.content})
+    socketio.emit('chat_msg', {'user': message.author.display_name, 'text': message.content})
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    if member == bot.user:
+        status = "Connected" if after.channel else "Disconnected"
+        socketio.emit('status_update', {
+            'status': status,
+            'mute': after.self_mute,
+            'deaf': after.self_deaf
+        })
 
 # --- WEB UI ---
 @app.route('/')
@@ -50,75 +63,91 @@ def index():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Discord Live Bridge</title>
+        <title>Discord Voice/Text Bridge</title>
         <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
         <style>
-            body { font-family: sans-serif; background: #2c2f33; color: white; display: flex; height: 100vh; margin: 0; }
-            #side { width: 300px; background: #23272a; padding: 20px; border-right: 1px solid #444; }
-            #main { flex: 1; display: flex; flex-direction: column; padding: 20px; }
-            #chat { flex: 1; background: #202225; overflow-y: auto; padding: 10px; margin-bottom: 10px; border-radius: 5px; }
-            .controls button { width: 100%; margin: 5px 0; padding: 10px; cursor: pointer; border: none; border-radius: 4px; color: white; }
-            .join { background: #43b581; } .leave { background: #f04747; } .mute { background: #5865f2; }
+            body { font-family: 'Segoe UI', sans-serif; background: #2f3136; color: white; display: flex; height: 100vh; margin: 0; }
+            #sidebar { width: 280px; background: #202225; padding: 20px; display: flex; flex-direction: column; gap: 10px; }
+            #chat-area { flex: 1; display: flex; flex-direction: column; padding: 20px; }
+            #log { flex: 1; background: #36393f; border-radius: 8px; padding: 15px; overflow-y: auto; margin-bottom: 10px; border: 1px solid #202225; }
+            button { padding: 12px; border: none; border-radius: 4px; color: white; cursor: pointer; font-weight: bold; }
+            .btn-join { background: #43b581; } .btn-leave { background: #f04747; } .btn-toggle { background: #4f545c; }
+            input { padding: 12px; background: #40444b; color: white; border: none; border-radius: 4px; }
+            .status-box { background: #2f3136; padding: 10px; border-radius: 4px; font-size: 0.9em; }
         </style>
     </head>
     <body>
-        <div id="side">
-            <h3>Voice Controls</h3>
-            <button class="join" onclick="control('join')">Join Voice</button>
-            <button class="mute" onclick="control('mute')">Toggle Mute</button>
-            <button class="mute" onclick="control('deafen')">Toggle Deafen</button>
-            <button class="leave" onclick="control('leave')">Leave</button>
-            <p id="v-status">Status: Disconnected</p>
+        <div id="sidebar">
+            <h3>Voice Control</h3>
+            <div class="status-box">
+                Status: <span id="st-val" style="color:#f04747">Disconnected</span><br>
+                Mute: <span id="st-mute">Off</span> | Deaf: <span id="st-deaf">Off</span>
+            </div>
+            <button class="btn-join" onclick="vCmd('join')">Join Channel</button>
+            <button class="btn-toggle" onclick="vCmd('mute')">Toggle Mute</button>
+            <button class="btn-toggle" onclick="vCmd('deafen')">Toggle Deafen</button>
+            <button class="btn-leave" onclick="vCmd('leave')">Disconnect</button>
+            <p style="font-size: 11px; color: #8e9297;">Click anywhere to enable audio if you don't hear anything.</p>
         </div>
-        <div id="main">
-            <div id="chat"></div>
-            <input type="text" id="minp" style="width:100%; padding:10px;" placeholder="Message..." onkeydown="if(event.key==='Enter') sendT()">
+        <div id="chat-area">
+            <div id="log"></div>
+            <input type="text" id="minp" placeholder="Message #channel..." onkeydown="if(event.key==='Enter') sendT()">
         </div>
 
         <script>
             const socket = io();
-            const chat = document.getElementById('chat');
-            
-            // Text Chat
-            socket.on('text_message', d => {
-                chat.innerHTML += `<div><b>${d.user}:</b> ${d.content}</div>`;
-                chat.scrollTop = chat.scrollHeight;
+            const log = document.getElementById('log');
+            const audioCtx = new (window.AudioContext || window.webkitAudioContext)({sampleRate: 48000});
+
+            // Handle UI Updates
+            socket.on('status_update', d => {
+                document.getElementById('st-val').innerText = d.status;
+                document.getElementById('st-val').style.color = d.status === "Connected" ? "#43b581" : "#f04747";
+                document.getElementById('st-mute').innerText = d.mute ? "ON" : "OFF";
+                document.getElementById('st-deaf').innerText = d.deaf ? "ON" : "OFF";
+            });
+
+            socket.on('chat_msg', d => {
+                log.innerHTML += `<div><b style="color:#7289da">${d.user}:</b> ${d.text}</div>`;
+                log.scrollTop = log.scrollHeight;
+            });
+
+            // Audio Playback (PCM 16-bit Le to Float32)
+            socket.on('audio_stream', d => {
+                if (audioCtx.state === 'suspended') return;
+                
+                const raw = new Int16Array(d.data);
+                const floatData = new Float32Array(raw.length);
+                for (let i = 0; i < raw.length; i++) floatData[i] = raw[i] / 32768;
+
+                const buffer = audioCtx.createBuffer(1, floatData.length, 48000);
+                buffer.getChannelData(0).set(floatData);
+                const source = audioCtx.createBufferSource();
+                source.buffer = buffer;
+                source.connect(audioCtx.destination);
+                source.start();
             });
 
             function sendT() {
                 const i = document.getElementById('minp');
+                if(!i.value) return;
                 socket.emit('send_text', {msg: i.value});
-                chat.innerHTML += `<div><i>(You): ${i.value}</i></div>`;
+                log.innerHTML += `<div><i style="color:#b9bbbe">(You): ${i.value}</i></div>`;
                 i.value = '';
             }
 
-            function control(action) { socket.emit('voice_control', {action}); }
-
-            // Audio Logic
-            const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-            socket.on('audio_data', d => {
-                // Incoming Discord Audio (PCM)
-                const buffer = new Float32Array(d.data.length / 2);
-                const view = new DataView(d.data);
-                for(let i=0; i<buffer.length; i++) buffer[i] = view.getInt16(i*2, true) / 32768;
-                
-                const audioBuffer = audioCtx.createBuffer(1, buffer.length, 48000);
-                audioBuffer.getChannelData(0).set(buffer);
-                const source = audioCtx.createBufferSource();
-                source.buffer = audioBuffer;
-                source.connect(audioCtx.destination);
-                source.start();
-            });
+            function vCmd(action) { socket.emit('voice_control', {action}); }
+            window.onclick = () => { if(audioCtx.state === 'suspended') audioCtx.resume(); };
         </script>
     </body>
     </html>
     """)
 
-# --- SOCKET EVENTS ---
+# --- SOCKET HANDLERS ---
 @socketio.on('send_text')
 def handle_text(data):
     channel = bot.get_channel(TEXT_CHANNEL_ID)
-    asyncio.run_coroutine_threadsafe(channel.send(data['msg']), bot_loop)
+    if bot_loop: asyncio.run_coroutine_threadsafe(channel.send(data['msg']), bot_loop)
 
 @socketio.on('voice_control')
 def handle_voice(data):
@@ -132,13 +161,17 @@ def handle_voice(data):
             vc_client = await ch.connect(cls=voice_recv.VoiceRecvClient)
             vc_client.listen(BrowserAudioSink())
         elif vc_client:
-            if action == 'leave': await vc_client.disconnect()
-            elif action == 'mute': await vc_client.main_ws.voice_state(vc_client.guild.id, vc_client.channel.id, self_mute=not vc_client.self_mute)
-            elif action == 'deafen': await vc_client.main_ws.voice_state(vc_client.guild.id, vc_client.channel.id, self_mute=vc_client.self_mute, self_deaf=not vc_client.self_deaf)
+            if action == 'leave': 
+                await vc_client.disconnect()
+                vc_client = None
+            elif action == 'mute': 
+                await vc_client.main_ws.voice_state(vc_client.guild.id, vc_client.channel.id, self_mute=not vc_client.self_mute)
+            elif action == 'deafen': 
+                await vc_client.main_ws.voice_state(vc_client.guild.id, vc_client.channel.id, self_mute=vc_client.self_mute, self_deaf=not vc_client.self_deaf)
 
-    asyncio.run_coroutine_threadsafe(vc_task(), bot_loop)
+    if bot_loop: asyncio.run_coroutine_threadsafe(vc_task(), bot_loop)
 
 if __name__ == "__main__":
-    t = threading.Thread(target=lambda: socketio.run(app, host='0.0.0.0', port=5050, allow_unsafe_werkzeug=True), daemon=True)
-    t.start()
+    # Use allow_unsafe_werkzeug=True if running locally for testing
+    threading.Thread(target=lambda: socketio.run(app, host='0.0.0.0', port=5050, allow_unsafe_werkzeug=True), daemon=True).start()
     bot.run(os.getenv('APITOK'))

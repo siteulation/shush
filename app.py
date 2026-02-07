@@ -5,160 +5,116 @@ from flask import Flask, render_template_string, request, jsonify
 import discord
 from discord.ext import commands
 
-# 1. Setup Discord Bot with proper Intents
+# --- CONFIGURATION ---
+TARGET_GUILD_ID = 952963110283657266
+TARGET_CHANNEL_ID = 1303054086454906920
+
+# Setup Discord Bot
 intents = discord.Intents.default()
-intents.guilds = True  # Required to see servers
+intents.guilds = True
 intents.messages = True
-intents.message_content = True # Required to read what people type
+intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 message_log = []
 
 @bot.event
 async def on_ready():
-    print(f'--- Bot is Online: {bot.user} ---')
-    print(f'Connected to {len(bot.guilds)} servers.')
+    print(f'--- Bot Active: {bot.user} ---')
+    print(f'Targeting Channel: {TARGET_CHANNEL_ID}')
 
 @bot.event
 async def on_message(message):
-    if message.author == bot.user: return
-    log_entry = f"[{message.guild.name if message.guild else 'DM'}] {message.author}: {message.content}"
-    message_log.append(log_entry)
+    if message.author == bot.user:
+        return
+    # Only log messages from our target channel to keep the feed clean
+    if message.channel.id == TARGET_CHANNEL_ID:
+        log_entry = f"<b>{message.author.display_name}:</b> {message.content}"
+        message_log.append(log_entry)
 
-# 2. Flask Application
+# --- FLASK WEB SERVER ---
 app = Flask(__name__)
 
-# NOTE: We use bot.loop.create_task or asyncio.run_coroutine_threadsafe 
-# because Flask runs in a different thread than the Discord Bot.
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Discord Direct Bridge</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #36393f; color: white; display: flex; justify-content: center; padding: 40px; }
+        .container { width: 100%; max-width: 600px; background: #2f3136; padding: 20px; border-radius: 8px; box-shadow: 0 4px 15px rgba(0,0,0,0.3); }
+        #log { height: 400px; overflow-y: auto; background: #202225; padding: 15px; border-radius: 5px; margin-bottom: 20px; border: 1px solid #4f545c; line-height: 1.5; }
+        .input-area { display: flex; gap: 10px; }
+        input { flex-grow: 1; padding: 12px; border-radius: 4px; border: none; background: #40444b; color: white; outline: none; }
+        button { padding: 10px 20px; background: #5865f2; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; }
+        button:hover { background: #4752c4; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>Direct Bridge to Discord</h2>
+        <div id="log"></div>
+        <div class="input-area">
+            <input type="text" id="msg" placeholder="Send a message..." onkeydown="if(event.key==='Enter') sendMsg()">
+            <button onclick="sendMsg()">Send</button>
+        </div>
+    </div>
 
-@app.route('/get_guilds')
-def get_guilds():
-    if not bot.is_ready():
-        return jsonify([])
-    
-    # We use bot.guilds which is the CACHED list. 
-    # If this is empty, the bot hasn't finished loading yet.
-    guild_data = [{"id": str(g.id), "name": g.name} for g in bot.guilds]
-    return jsonify(guild_data)
+    <script>
+        async function sendMsg() {
+            const input = document.getElementById('msg');
+            const text = input.value;
+            if(!text) return;
 
-@app.route('/get_channels/<guild_id>')
-def get_channels(guild_id):
-    guild = bot.get_guild(int(guild_id))
-    if not guild:
-        return jsonify([])
-    
-    # Filter for Text Channels the bot can actually post in
-    channels = [
-        {"id": str(c.id), "name": c.name} 
-        for c in guild.text_channels 
-        if c.permissions_for(guild.me).send_messages
-    ]
-    return jsonify(channels)
+            await fetch('/send', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({message: text})
+            });
+            input.value = '';
+        }
+
+        async function updateLog() {
+            const res = await fetch('/messages');
+            const data = await res.json();
+            const logDiv = document.getElementById('log');
+            
+            // Only update if content changed
+            const newContent = data.join('<br>');
+            if (logDiv.innerHTML !== newContent) {
+                logDiv.innerHTML = newContent;
+                logDiv.scrollTop = logDiv.scrollHeight; // Auto-scroll
+            }
+        }
+
+        setInterval(updateLog, 1500);
+    </script>
+</body>
+</html>
+"""
+
+@app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE)
 
 @app.route('/send', methods=['POST'])
-def send_to_discord():
-    data = request.json
-    channel_id = data.get('channel_id')
-    user_text = data.get('message')
-    
-    if channel_id and user_text:
-        channel = bot.get_channel(int(channel_id))
+def send():
+    user_text = request.json.get('message')
+    if user_text:
+        channel = bot.get_channel(TARGET_CHANNEL_ID)
         if channel:
-            # We must use the bot's event loop to send messages from the Flask thread
             bot.loop.create_task(channel.send(user_text))
-            message_log.append(f"Web -> #{channel.name}: {user_text}")
-            return jsonify(success=True)
-    return jsonify(success=False), 400
+            message_log.append(f"<i>(You): {user_text}</i>")
+            return jsonify(status="sent")
+    return jsonify(status="error"), 400
 
 @app.route('/messages')
 def get_messages():
     return jsonify(message_log)
 
-@app.route('/')
-def index():
-    # Adding a simple 'Refresh' button to the UI in case the cache was empty on first load
-    return render_template_string("""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Discord Control Panel</title>
-        <style>
-            body { font-family: 'Segoe UI', sans-serif; padding: 20px; background: #2c2f33; color: white; }
-            select, input, button { padding: 10px; border-radius: 5px; border: none; margin: 5px 0; }
-            #log { background: #23272a; height: 300px; overflow-y: scroll; padding: 10px; border: 1px solid #7289da; }
-            .box { background: #36393f; padding: 20px; border-radius: 10px; }
-        </style>
-    </head>
-    <body>
-        <div class="box">
-            <h1>Discord Bridge</h1>
-            <button onclick="loadGuilds()">🔄 Refresh Server List</button><br><br>
-            
-            <label>Server:</label><br>
-            <select id="g_select" onchange="updateChannels()" style="width:100%"></select><br>
-            
-            <label>Channel:</label><br>
-            <select id="c_select" style="width:100%"></select><br><br>
-            
-            <input type="text" id="msg" placeholder="Type a message..." style="width:80%">
-            <button onclick="sendMsg()" style="background:#7289da; color:white; width:15%">Send</button>
-        </div>
-
-        <h3>Live Feed</h3>
-        <div id="log"></div>
-
-        <script>
-            async function loadGuilds() {
-                const r = await fetch('/get_guilds');
-                const guilds = await r.json();
-                const s = document.getElementById('g_select');
-                s.innerHTML = '<option>-- Select Server --</option>';
-                guilds.forEach(g => s.innerHTML += `<option value="${g.id}">${g.name}</option>`);
-            }
-
-            async function updateChannels() {
-                const gid = document.getElementById('g_select').value;
-                const r = await fetch('/get_channels/' + gid);
-                const channels = await r.json();
-                const s = document.getElementById('c_select');
-                s.innerHTML = '';
-                channels.forEach(c => s.innerHTML += `<option value="${c.id}"># ${c.name}</option>`);
-            }
-
-            async function sendMsg() {
-                const cid = document.getElementById('c_select').value;
-                const txt = document.getElementById('msg').value;
-                await fetch('/send', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({channel_id: cid, message: txt})
-                });
-                document.getElementById('msg').value = '';
-            }
-
-            setInterval(async () => {
-                const r = await fetch('/messages');
-                const data = await r.json();
-                document.getElementById('log').innerHTML = data.slice().reverse().join('<br>');
-            }, 2000);
-
-            window.onload = loadGuilds;
-        </script>
-    </body>
-    </html>
-    """)
-
-# 3. Execution Logic
 def run_flask():
     app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
 
 if __name__ == "__main__":
-    t = threading.Thread(target=run_flask)
-    t.daemon = True
-    t.start()
-    
-    token = os.getenv('APITOK')
-    if not token:
-        print("ERROR: APITOK environment variable not found!")
-    else:
-        bot.run(token)
+    threading.Thread(target=run_flask, daemon=True).start()
+    bot.run(os.getenv('APITOK'))

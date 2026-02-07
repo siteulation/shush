@@ -2,3 +2,6 @@ gunicorn
 discord.py
 flask
 python-dotenv
+discord.py[voice]
+discord-ext-voice-recv
+PyNaCl

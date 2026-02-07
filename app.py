@@ -1,41 +1,40 @@
 import os
 import asyncio
 import threading
+import queue
 from flask import Flask, render_template_string, request, jsonify
 import discord
 from discord.ext import commands
+from discord.ext import voice_recv
 
 # --- CONFIGURATION ---
-TARGET_CHANNEL_ID = 1303054086454906920
+TEXT_CHANNEL_ID = 1303054086454906920
+VOICE_CHANNEL_ID = 1462980688256040970
 
 intents = discord.Intents.default()
 intents.messages = True
 intents.message_content = True
+intents.voice_states = True
+
 bot = commands.Bot(command_prefix="!", intents=intents)
-
 message_log = []
-# We'll use this to safely bridge the Flask thread to the Discord thread
 bot_loop = None
+vc_client = None
 
+# --- DISCORD LOGIC ---
 @bot.event
 async def on_ready():
     global bot_loop
     bot_loop = asyncio.get_running_loop()
-    print(f'✅ Bot Online: {bot.user}')
-    print(f'✅ Monitoring Channel: {TARGET_CHANNEL_ID}')
+    print(f'✅ Connected as {bot.user}')
 
 @bot.event
 async def on_message(message):
-    if message.author == bot.user:
-        return
-    if message.channel.id == TARGET_CHANNEL_ID:
-        log_entry = f"<b>{message.author.display_name}:</b> {message.content}"
-        message_log.append(log_entry)
-        # Keep log size manageable
-        if len(message_log) > 50:
-            message_log.pop(0)
+    if message.author == bot.user: return
+    if message.channel.id == TEXT_CHANNEL_ID:
+        message_log.append(f"<b>{message.author.display_name}:</b> {message.content}")
 
-# --- FLASK ---
+# --- FLASK SERVER ---
 app = Flask(__name__)
 
 @app.route('/')
@@ -44,101 +43,100 @@ def index():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Discord Bridge</title>
+        <title>Discord Unified Bridge</title>
         <style>
-            body { font-family: sans-serif; background: #36393f; color: white; padding: 20px; max-width: 800px; margin: auto; }
-            #log { height: 400px; overflow-y: auto; background: #202225; padding: 15px; border-radius: 8px; margin-bottom: 10px; border: 1px solid #4f545c; }
-            .input-box { display: flex; gap: 10px; }
-            input { flex: 1; padding: 12px; background: #40444b; color: white; border: none; border-radius: 4px; }
-            button { padding: 10px 20px; background: #5865f2; color: white; border: none; border-radius: 4px; cursor: pointer; }
-            button:disabled { background: #3c4270; }
+            body { font-family: sans-serif; background: #2c2f33; color: white; display: grid; grid-template-columns: 1fr 300px; height: 100vh; margin: 0; }
+            #chat-section { display: flex; flex-direction: column; padding: 20px; border-right: 1px solid #444; }
+            #voice-section { padding: 20px; background: #23272a; }
+            #log { flex: 1; overflow-y: auto; background: #202225; padding: 10px; border-radius: 5px; margin-bottom: 10px; }
+            input { width: 100%; padding: 10px; box-sizing: border-box; background: #40444b; color: white; border: none; }
+            .btn { padding: 10px; margin: 5px 0; width: 100%; cursor: pointer; border: none; border-radius: 4px; color: white; font-weight: bold; }
+            .join { background: #43b581; } .leave { background: #f04747; } .action { background: #5865f2; }
         </style>
     </head>
     <body>
-        <h2>Channel Bridge</h2>
-        <div id="log">Loading messages...</div>
-        <div class="input-box">
-            <input type="text" id="msg" placeholder="Type a message..." autocomplete="off">
-            <button id="sendBtn" onclick="send()">Send</button>
+        <div id="chat-section">
+            <div id="log"></div>
+            <input type="text" id="msg" placeholder="Send text message..." onkeydown="if(event.key==='Enter') sendText()">
+        </div>
+        <div id="voice-section">
+            <h3>Voice Controls</h3>
+            <button class="btn join" onclick="voiceAction('join')">Join Voice</button>
+            <button class="btn action" onclick="voiceAction('mute')">Mute / Unmute</button>
+            <button class="btn action" onclick="voiceAction('deafen')">Deafen / Undeafen</button>
+            <button class="btn leave" onclick="voiceAction('leave')">Disconnect</button>
+            <hr>
+            <p><small>Note: Real-time browser audio streaming requires a WebRTC gateway. Currently supports Push-to-Talk via Server.</small></p>
         </div>
 
         <script>
-            const msgInput = document.getElementById('msg');
-            const logDiv = document.getElementById('log');
-
-            async function send() {
-                const text = msgInput.value.trim();
-                if (!text) return;
-
-                // Visual feedback
-                msgInput.value = '';
-                
-                try {
-                    const response = await fetch('/send', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({message: text})
-                    });
-                    if (!response.ok) alert("Failed to send message.");
-                } catch (e) {
-                    console.error("Send error:", e);
-                }
+            async function sendText() {
+                const i = document.getElementById('msg');
+                await fetch('/send_text', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({message: i.value})
+                });
+                i.value = '';
             }
 
-            // Allow Enter key to send
-            msgInput.addEventListener("keypress", (e) => {
-                if (e.key === "Enter") send();
-            });
-
-            async function updateLog() {
-                try {
-                    const r = await fetch('/messages');
-                    const d = await r.json();
-                    const newContent = d.join('<br>');
-                    if (logDiv.innerHTML !== newContent) {
-                        logDiv.innerHTML = newContent;
-                        logDiv.scrollTop = logDiv.scrollHeight;
-                    }
-                } catch (e) { console.error("Update error:", e); }
+            async function voiceAction(type) {
+                await fetch('/voice_control', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({action: type})
+                });
             }
 
-            setInterval(updateLog, 1000);
+            setInterval(async () => {
+                const r = await fetch('/get_messages');
+                const d = await r.json();
+                const l = document.getElementById('log');
+                l.innerHTML = d.join('<br>');
+                l.scrollTop = l.scrollHeight;
+            }, 1000);
         </script>
     </body>
     </html>
     """)
 
-@app.route('/send', methods=['POST'])
-def send_msg():
-    data = request.get_json()
-    text = data.get('message')
-    
-    if text and bot_loop:
-        channel = bot.get_channel(TARGET_CHANNEL_ID)
-        if channel:
-            # Python 3.13 Thread-Safe Bridge
-            asyncio.run_coroutine_threadsafe(channel.send(text), bot_loop)
-            message_log.append(f"<i>(You): {text}</i>")
-            return jsonify(success=True)
-    
-    return jsonify(success=False), 400
-
-@app.route('/messages')
+@app.route('/get_messages')
 def get_messages():
     return jsonify(message_log)
 
-def run_flask():
-    # port 5000 is often used by macOS AirPlay, using 5050 for safety
-    app.run(host='0.0.0.0', port=5050, debug=False, use_reloader=False)
+@app.route('/send_text', methods=['POST'])
+def send_text():
+    text = request.json.get('message')
+    if text and bot_loop:
+        channel = bot.get_channel(TEXT_CHANNEL_ID)
+        asyncio.run_coroutine_threadsafe(channel.send(text), bot_loop)
+        message_log.append(f"<i>(You): {text}</i>")
+    return jsonify(success=True)
+
+@app.route('/voice_control', methods=['POST'])
+def voice_control():
+    global vc_client
+    action = request.json.get('action')
+    
+    if not bot_loop: return jsonify(error="Bot not ready"), 400
+
+    async def handle_voice():
+        global vc_client
+        if action == 'join':
+            channel = bot.get_channel(VOICE_CHANNEL_ID)
+            vc_client = await channel.connect(cls=voice_recv.VoiceRecvClient)
+        elif vc_client:
+            if action == 'leave':
+                await vc_client.disconnect()
+                vc_client = None
+            elif action == 'mute':
+                await vc_client.main_ws.voice_state(guild_id=vc_client.guild.id, channel_id=vc_client.channel.id, self_mute=not vc_client.self_mute)
+            elif action == 'deafen':
+                await vc_client.main_ws.voice_state(guild_id=vc_client.guild.id, channel_id=vc_client.channel.id, self_mute=vc_client.self_mute, self_deaf=not vc_client.self_deaf)
+
+    asyncio.run_coroutine_threadsafe(handle_voice(), bot_loop)
+    return jsonify(success=True)
 
 if __name__ == "__main__":
-    token = os.getenv('APITOK')
-    if not token:
-        print("❌ Error: APITOK environment variable is missing!")
-    else:
-        # Start Flask in background
-        flask_thread = threading.Thread(target=run_flask, daemon=True)
-        flask_thread.start()
-        
-        # Start Discord in foreground
-        bot.run(token)
+    threading.Thread(target=lambda: app.run(host='0.0.0.0', port=5050, debug=False, use_reloader=False), daemon=True).start()
+    bot.run(os.getenv('APITOK'))

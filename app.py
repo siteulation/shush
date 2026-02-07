@@ -1,13 +1,12 @@
 import os
 import asyncio
 import threading
-import queue
-from flask import Flask, render_template_string, request, jsonify
+from flask import Flask, render_template_string
+from flask_socketio import SocketIO, emit
 import discord
-from discord.ext import commands
-from discord.ext import voice_recv
+from discord.ext import commands, voice_recv
 
-# --- CONFIGURATION ---
+# --- CONFIG ---
 TEXT_CHANNEL_ID = 1303054086454906920
 VOICE_CHANNEL_ID = 1462980688256040970
 
@@ -15,128 +14,131 @@ intents = discord.Intents.default()
 intents.messages = True
 intents.message_content = True
 intents.voice_states = True
-
 bot = commands.Bot(command_prefix="!", intents=intents)
-message_log = []
+
+app = Flask(__name__)
+socketio = SocketIO(app, cors_allowed_origins="*")
+
 bot_loop = None
 vc_client = None
 
-# --- DISCORD LOGIC ---
+# --- DISCORD RECEIVE AUDIO ---
+class BrowserAudioSink(voice_recv.AudioSink):
+    def want_opus(self):
+        return False # We want PCM to send to browser easily
+
+    def write(self, user, data):
+        # Send raw audio bytes to the browser via WebSocket
+        socketio.emit('audio_data', {'user': str(user), 'data': data.pcm})
+
 @bot.event
 async def on_ready():
     global bot_loop
     bot_loop = asyncio.get_running_loop()
-    print(f'✅ Connected as {bot.user}')
+    print(f'✅ Bot Online: {bot.user}')
 
 @bot.event
 async def on_message(message):
-    if message.author == bot.user: return
-    if message.channel.id == TEXT_CHANNEL_ID:
-        message_log.append(f"<b>{message.author.display_name}:</b> {message.content}")
+    if message.author == bot.user or message.channel.id != TEXT_CHANNEL_ID:
+        return
+    socketio.emit('text_message', {'user': message.author.display_name, 'content': message.content})
 
-# --- FLASK SERVER ---
-app = Flask(__name__)
-
+# --- WEB UI ---
 @app.route('/')
 def index():
     return render_template_string("""
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Discord Unified Bridge</title>
+        <title>Discord Live Bridge</title>
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
         <style>
-            body { font-family: sans-serif; background: #2c2f33; color: white; display: grid; grid-template-columns: 1fr 300px; height: 100vh; margin: 0; }
-            #chat-section { display: flex; flex-direction: column; padding: 20px; border-right: 1px solid #444; }
-            #voice-section { padding: 20px; background: #23272a; }
-            #log { flex: 1; overflow-y: auto; background: #202225; padding: 10px; border-radius: 5px; margin-bottom: 10px; }
-            input { width: 100%; padding: 10px; box-sizing: border-box; background: #40444b; color: white; border: none; }
-            .btn { padding: 10px; margin: 5px 0; width: 100%; cursor: pointer; border: none; border-radius: 4px; color: white; font-weight: bold; }
-            .join { background: #43b581; } .leave { background: #f04747; } .action { background: #5865f2; }
+            body { font-family: sans-serif; background: #2c2f33; color: white; display: flex; height: 100vh; margin: 0; }
+            #side { width: 300px; background: #23272a; padding: 20px; border-right: 1px solid #444; }
+            #main { flex: 1; display: flex; flex-direction: column; padding: 20px; }
+            #chat { flex: 1; background: #202225; overflow-y: auto; padding: 10px; margin-bottom: 10px; border-radius: 5px; }
+            .controls button { width: 100%; margin: 5px 0; padding: 10px; cursor: pointer; border: none; border-radius: 4px; color: white; }
+            .join { background: #43b581; } .leave { background: #f04747; } .mute { background: #5865f2; }
         </style>
     </head>
     <body>
-        <div id="chat-section">
-            <div id="log"></div>
-            <input type="text" id="msg" placeholder="Send text message..." onkeydown="if(event.key==='Enter') sendText()">
-        </div>
-        <div id="voice-section">
+        <div id="side">
             <h3>Voice Controls</h3>
-            <button class="btn join" onclick="voiceAction('join')">Join Voice</button>
-            <button class="btn action" onclick="voiceAction('mute')">Mute / Unmute</button>
-            <button class="btn action" onclick="voiceAction('deafen')">Deafen / Undeafen</button>
-            <button class="btn leave" onclick="voiceAction('leave')">Disconnect</button>
-            <hr>
-            <p><small>Note: Real-time browser audio streaming requires a WebRTC gateway. Currently supports Push-to-Talk via Server.</small></p>
+            <button class="join" onclick="control('join')">Join Voice</button>
+            <button class="mute" onclick="control('mute')">Toggle Mute</button>
+            <button class="mute" onclick="control('deafen')">Toggle Deafen</button>
+            <button class="leave" onclick="control('leave')">Leave</button>
+            <p id="v-status">Status: Disconnected</p>
+        </div>
+        <div id="main">
+            <div id="chat"></div>
+            <input type="text" id="minp" style="width:100%; padding:10px;" placeholder="Message..." onkeydown="if(event.key==='Enter') sendT()">
         </div>
 
         <script>
-            async function sendText() {
-                const i = document.getElementById('msg');
-                await fetch('/send_text', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({message: i.value})
-                });
+            const socket = io();
+            const chat = document.getElementById('chat');
+            
+            // Text Chat
+            socket.on('text_message', d => {
+                chat.innerHTML += `<div><b>${d.user}:</b> ${d.content}</div>`;
+                chat.scrollTop = chat.scrollHeight;
+            });
+
+            function sendT() {
+                const i = document.getElementById('minp');
+                socket.emit('send_text', {msg: i.value});
+                chat.innerHTML += `<div><i>(You): ${i.value}</i></div>`;
                 i.value = '';
             }
 
-            async function voiceAction(type) {
-                await fetch('/voice_control', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({action: type})
-                });
-            }
+            function control(action) { socket.emit('voice_control', {action}); }
 
-            setInterval(async () => {
-                const r = await fetch('/get_messages');
-                const d = await r.json();
-                const l = document.getElementById('log');
-                l.innerHTML = d.join('<br>');
-                l.scrollTop = l.scrollHeight;
-            }, 1000);
+            // Audio Logic
+            const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            socket.on('audio_data', d => {
+                // Incoming Discord Audio (PCM)
+                const buffer = new Float32Array(d.data.length / 2);
+                const view = new DataView(d.data);
+                for(let i=0; i<buffer.length; i++) buffer[i] = view.getInt16(i*2, true) / 32768;
+                
+                const audioBuffer = audioCtx.createBuffer(1, buffer.length, 48000);
+                audioBuffer.getChannelData(0).set(buffer);
+                const source = audioCtx.createBufferSource();
+                source.buffer = audioBuffer;
+                source.connect(audioCtx.destination);
+                source.start();
+            });
         </script>
     </body>
     </html>
     """)
 
-@app.route('/get_messages')
-def get_messages():
-    return jsonify(message_log)
+# --- SOCKET EVENTS ---
+@socketio.on('send_text')
+def handle_text(data):
+    channel = bot.get_channel(TEXT_CHANNEL_ID)
+    asyncio.run_coroutine_threadsafe(channel.send(data['msg']), bot_loop)
 
-@app.route('/send_text', methods=['POST'])
-def send_text():
-    text = request.json.get('message')
-    if text and bot_loop:
-        channel = bot.get_channel(TEXT_CHANNEL_ID)
-        asyncio.run_coroutine_threadsafe(channel.send(text), bot_loop)
-        message_log.append(f"<i>(You): {text}</i>")
-    return jsonify(success=True)
-
-@app.route('/voice_control', methods=['POST'])
-def voice_control():
+@socketio.on('voice_control')
+def handle_voice(data):
     global vc_client
-    action = request.json.get('action')
-    
-    if not bot_loop: return jsonify(error="Bot not ready"), 400
+    action = data['action']
 
-    async def handle_voice():
+    async def vc_task():
         global vc_client
         if action == 'join':
-            channel = bot.get_channel(VOICE_CHANNEL_ID)
-            vc_client = await channel.connect(cls=voice_recv.VoiceRecvClient)
+            ch = bot.get_channel(VOICE_CHANNEL_ID)
+            vc_client = await ch.connect(cls=voice_recv.VoiceRecvClient)
+            vc_client.listen(BrowserAudioSink())
         elif vc_client:
-            if action == 'leave':
-                await vc_client.disconnect()
-                vc_client = None
-            elif action == 'mute':
-                await vc_client.main_ws.voice_state(guild_id=vc_client.guild.id, channel_id=vc_client.channel.id, self_mute=not vc_client.self_mute)
-            elif action == 'deafen':
-                await vc_client.main_ws.voice_state(guild_id=vc_client.guild.id, channel_id=vc_client.channel.id, self_mute=vc_client.self_mute, self_deaf=not vc_client.self_deaf)
+            if action == 'leave': await vc_client.disconnect()
+            elif action == 'mute': await vc_client.main_ws.voice_state(vc_client.guild.id, vc_client.channel.id, self_mute=not vc_client.self_mute)
+            elif action == 'deafen': await vc_client.main_ws.voice_state(vc_client.guild.id, vc_client.channel.id, self_mute=vc_client.self_mute, self_deaf=not vc_client.self_deaf)
 
-    asyncio.run_coroutine_threadsafe(handle_voice(), bot_loop)
-    return jsonify(success=True)
+    asyncio.run_coroutine_threadsafe(vc_task(), bot_loop)
 
 if __name__ == "__main__":
-    threading.Thread(target=lambda: app.run(host='0.0.0.0', port=5050, debug=False, use_reloader=False), daemon=True).start()
+    t = threading.Thread(target=lambda: socketio.run(app, host='0.0.0.0', port=5050, allow_unsafe_werkzeug=True), daemon=True)
+    t.start()
     bot.run(os.getenv('APITOK'))

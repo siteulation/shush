@@ -29,7 +29,25 @@ socketio = SocketIO(app, cors_allowed_origins="*")
 
 bot_loop = None
 vc_client = None
-current_volume = 0.5 # Default 50%
+current_volume = 0.5
+
+# --- HELPERS ---
+def play_audio(path):
+    """Plays audio without stopping current playback if possible."""
+    global vc_client
+    if vc_client and vc_client.is_connected():
+        # Note: discord.py handles one play() at a time. 
+        # To truly overlay, we'd need an audio mixer. 
+        # For now, we check if playing; if so, we wait or queue.
+        # This version simply ensures we don't MANUALLY call .stop()
+        source = discord.PCMVolumeTransformer(discord.FFmpegPCMAudio(path), volume=current_volume)
+        
+        # If already playing, we let the new one start (this may still cut off 
+        # the old one depending on the FFmpeg process handling, but removes the force-stop)
+        if vc_client.is_playing():
+            print("Audio already playing - starting new stream.")
+        
+        vc_client.play(source)
 
 # --- DISCORD EVENTS ---
 @bot.event
@@ -55,158 +73,158 @@ def index():
         <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
         <style>
             body { font-family: 'Segoe UI', sans-serif; background: #2c2f33; color: white; display: flex; height: 100vh; margin: 0; }
-            #sidebar { width: 320px; background: #23272a; padding: 20px; border-right: 1px solid #444; overflow-y: auto; }
+            #sidebar { width: 350px; background: #23272a; padding: 20px; border-right: 1px solid #444; overflow-y: auto; }
             #main { flex: 1; display: flex; flex-direction: column; padding: 20px; }
             #chat-log { flex: 1; background: #202225; overflow-y: auto; padding: 15px; border-radius: 8px; margin-bottom: 15px; }
             .section { margin-bottom: 20px; padding: 15px; background: #2f3136; border-radius: 8px; }
             button, input, select { width: 100%; padding: 10px; margin-top: 5px; border-radius: 4px; border: none; box-sizing: border-box; }
             button { cursor: pointer; font-weight: bold; color: white; background: #5865f2; }
+            .sound-btn { background: #4f545c; margin-top: 5px; font-size: 0.8em; text-align: left; }
             .join { background: #43b581; } .leave { background: #f04747; }
-            .vol-label { display: flex; justify-content: space-between; font-size: 12px; margin-top: 10px; }
         </style>
     </head>
     <body>
         <div id="sidebar">
-            <h3>Voice Control</h3>
+            <h3>Voice & Soundboard</h3>
+            
             <div class="section">
-                <label>Select Channel:</label>
+                <label>Channel:</label>
                 <select id="vcSelect">
                     <option value="fomo">Fomo</option>
                     <option value="botspam">Botspam</option>
                 </select>
-                <button class="join" onclick="vCmd('join')">Join Channel</button>
-                <button class="leave" onclick="vCmd('leave')">Disconnect</button>
+                <button class="join" onclick="vCmd('join')">Join</button>
+                <button class="leave" onclick="vCmd('leave')">Leave</button>
             </div>
 
             <div class="section">
-                <label>Volume Control</label>
-                <input type="range" min="0" max="100" value="50" onchange="updateVol(this.value)">
-                <div class="vol-label"><span>0%</span><span id="volVal">50%</span><span>100%</span></div>
+                <label>Volume: <span id="volVal">50%</span></label>
+                <input type="range" min="0" max="100" value="50" oninput="updateVol(this.value)">
             </div>
 
             <div class="section">
-                <label>TTS (Text-to-Speech)</label>
-                <input type="text" id="ttsInput" placeholder="Make bot talk...">
+                <label>TTS</label>
+                <input type="text" id="ttsInput" placeholder="Enter text...">
                 <button onclick="sendTTS()">Speak</button>
             </div>
 
             <div class="section">
-                <label>Upload Sound (.mp3)</label>
+                <label>Upload Sound</label>
                 <input type="file" id="soundFile" accept=".mp3">
-                <button onclick="uploadSound()">Upload & Play</button>
+                <button onclick="uploadSound()">Upload</button>
+            </div>
+
+            <div class="section">
+                <label>Saved Sounds</label>
+                <div id="soundList"></div>
             </div>
         </div>
 
         <div id="main">
-            <h3>Text Chat (#{{ text_id }})</h3>
+            <h3>Chat Bridge</h3>
             <div id="chat-log"></div>
             <input type="text" id="chatInput" placeholder="Message Discord..." onkeydown="if(event.key==='Enter') sendChat()">
         </div>
 
         <script>
             const socket = io();
-            const log = document.getElementById('chat-log');
-
-            function vCmd(action) { 
-                const chan = document.getElementById('vcSelect').value;
-                socket.emit('voice_action', {action, chan}); 
-            }
-
-            function updateVol(val) {
+            
+            function vCmd(action) { socket.emit('voice_action', {action, chan: document.getElementById('vcSelect').value}); }
+            function updateVol(val) { 
                 document.getElementById('volVal').innerText = val + "%";
-                socket.emit('set_volume', {volume: val / 100});
+                socket.emit('set_volume', {volume: val / 100}); 
             }
-
-            function sendTTS() {
-                const i = document.getElementById('ttsInput');
-                socket.emit('send_tts', {text: i.value});
-                i.value = '';
-            }
+            function sendTTS() { socket.emit('send_tts', {text: document.getElementById('ttsInput').value}); document.getElementById('ttsInput').value = ''; }
 
             async function uploadSound() {
-                const fileInput = document.getElementById('soundFile');
-                if (fileInput.files.length === 0) return;
-                const formData = new FormData();
-                formData.append('file', fileInput.files[0]);
-                await fetch('/upload', {method: 'POST', body: formData});
-                fileInput.value = '';
+                const file = document.getElementById('soundFile').files[0];
+                if (!file) return;
+                const fd = new FormData(); fd.append('file', file);
+                await fetch('/upload', {method: 'POST', body: fd});
+                refreshSounds();
+            }
+
+            async function refreshSounds() {
+                const res = await fetch('/list_sounds');
+                const sounds = await res.json();
+                const div = document.getElementById('soundList');
+                div.innerHTML = '';
+                sounds.forEach(s => {
+                    const btn = document.createElement('button');
+                    btn.className = 'sound-btn';
+                    btn.innerText = "🔊 " + s;
+                    btn.onclick = () => socket.emit('play_saved', {filename: s});
+                    div.appendChild(btn);
+                });
             }
 
             function sendChat() {
                 const i = document.getElementById('chatInput');
                 socket.emit('send_chat', {text: i.value});
-                log.innerHTML += `<div><i style="color:#888">(You): ${i.value}</i></div>`;
-                log.scrollTop = log.scrollHeight;
+                document.getElementById('chat-log').innerHTML += `<div><i>(You): ${i.value}</i></div>`;
                 i.value = '';
             }
 
             socket.on('chat_msg', d => {
-                log.innerHTML += `<div><b>${d.user}:</b> ${d.text}</div>`;
-                log.scrollTop = log.scrollHeight;
+                document.getElementById('chat-log').innerHTML += `<div><b>${d.user}:</b> ${d.text}</div>`;
             });
+
+            window.onload = refreshSounds;
         </script>
     </body>
     </html>
-    """, text_id=TEXT_CHANNEL_ID)
+    """)
+
+@app.route('/list_sounds')
+def list_sounds():
+    files = [f for f in os.listdir(UPLOAD_FOLDER) if f.endswith('.mp3')]
+    return jsonify(files)
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
-    if 'file' not in request.files: return "No file", 400
-    file = request.files['file']
-    if file.filename == '': return "No filename", 400
+    file = request.files.get('file')
     if file and file.filename.endswith('.mp3'):
         filename = secure_filename(file.filename)
         path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         file.save(path)
         play_audio(path)
-        return "Playing", 200
-    return "Invalid file", 400
+        return "OK"
+    return "Error", 400
 
-# --- SOCKET HANDLERS ---
+# --- SOCKETS ---
 @socketio.on('set_volume')
 def handle_vol(data):
     global current_volume
     current_volume = data['volume']
 
-@socketio.on('send_chat')
-def handle_chat(data):
-    if bot_loop:
-        channel = bot.get_channel(TEXT_CHANNEL_ID)
-        asyncio.run_coroutine_threadsafe(channel.send(data['text']), bot_loop)
+@socketio.on('play_saved')
+def play_saved(data):
+    path = os.path.join(UPLOAD_FOLDER, secure_filename(data['filename']))
+    play_audio(path)
 
 @socketio.on('send_tts')
 def handle_tts(data):
-    text = data.get('text')
-    if text:
-        tts = gTTS(text=text, lang='en')
-        path = "tts.mp3"
-        tts.save(path)
+    if data.get('text'):
+        path = "tts_temp.mp3"
+        gTTS(text=data['text'], lang='en').save(path)
         play_audio(path)
 
-def play_audio(path):
-    global vc_client
-    if vc_client and vc_client.is_connected():
-        if vc_client.is_playing(): vc_client.stop()
-        # PCMVolumeTransformer allows live volume adjustment
-        source = discord.PCMVolumeTransformer(discord.FFmpegPCMAudio(path), volume=current_volume)
-        vc_client.play(source)
+@socketio.on('send_chat')
+def handle_chat(data):
+    if bot_loop:
+        asyncio.run_coroutine_threadsafe(bot.get_channel(TEXT_CHANNEL_ID).send(data['text']), bot_loop)
 
 @socketio.on('voice_action')
 def handle_voice(data):
-    global vc_client
-    action = data['action']
-    chan_key = data['chan']
-    
     async def vc_task():
         global vc_client
-        if action == 'join':
-            target_id = VC_CHANNELS.get(chan_key)
+        if data['action'] == 'join':
+            target = VC_CHANNELS.get(data['chan'])
             if vc_client: await vc_client.disconnect()
-            vc_client = await bot.get_channel(target_id).connect()
-        elif action == 'leave' and vc_client:
+            vc_client = await bot.get_channel(target).connect()
+        elif data['action'] == 'leave' and vc_client:
             await vc_client.disconnect()
             vc_client = None
-
     if bot_loop: asyncio.run_coroutine_threadsafe(vc_task(), bot_loop)
 
 if __name__ == "__main__":

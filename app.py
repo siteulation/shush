@@ -19,7 +19,7 @@ intents = discord.Intents.default()
 intents.messages = True
 intents.message_content = True
 intents.voice_states = True
-intents.members = True # Required for @pings
+intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 app = Flask(__name__)
@@ -36,6 +36,7 @@ class LiveMixer(discord.AudioSource):
     def add_source(self, path):
         self.sources.append(discord.FFmpegPCMAudio(path, options="-f s16le -ar 48000 -ac 2"))
     def stop_all(self):
+        for s in self.sources: s.cleanup()
         self.sources = []
     def read(self):
         final_buffer = np.zeros(1920, dtype=np.int32)
@@ -63,10 +64,7 @@ async def on_ready():
 @bot.event
 async def on_message(message):
     if message.channel.id != TEXT_ID: return
-    
-    # Process Attachments
     img_url = message.attachments[0].url if message.attachments else None
-    
     socketio.emit('chat_msg', {
         'user': message.author.display_name,
         'pfp': str(message.author.display_avatar.url),
@@ -85,47 +83,64 @@ def index():
         <title>Discord Master Station</title>
         <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
         <style>
-            body { font-family: 'Helvetica Neue', sans-serif; background: #36393f; color: #dcddde; display: flex; height: 100vh; margin: 0; }
-            #side { width: 320px; background: #2f3136; padding: 15px; border-right: 1px solid #202225; overflow-y: auto; }
+            body { font-family: 'Segoe UI', sans-serif; background: #36393f; color: #dcddde; display: flex; height: 100vh; margin: 0; }
+            #side { width: 340px; background: #2f3136; padding: 15px; border-right: 1px solid #202225; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
             #chat-wrap { flex: 1; display: flex; flex-direction: column; background: #36393f; }
-            #log { flex: 1; overflow-y: auto; padding: 20px; }
-            .msg { display: flex; gap: 10px; margin-bottom: 15px; }
-            .msg img.pfp { width: 40px; height: 40px; border-radius: 50%; }
-            .msg-content { background: #40444b; padding: 8px 12px; border-radius: 8px; max-width: 80%; }
+            #log { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; }
+            .msg { display: flex; gap: 12px; margin-bottom: 15px; align-items: flex-start; }
+            .msg img.pfp { width: 38px; height: 38px; border-radius: 50%; background: #202225; }
+            .msg-content { background: #40444b; padding: 10px; border-radius: 8px; max-width: 75%; position: relative; }
             .msg-me { flex-direction: row-reverse; }
             .msg-me .msg-content { background: #5865f2; color: white; }
-            .attach-img { max-width: 300px; border-radius: 5px; margin-top: 5px; display: block; }
+            .attach-img { max-width: 100%; border-radius: 4px; margin-top: 8px; cursor: pointer; }
             
-            .section { background: #202225; padding: 10px; border-radius: 5px; margin-bottom: 10px; }
-            button { width: 100%; padding: 8px; margin-top: 5px; border: none; border-radius: 3px; cursor: pointer; color: white; font-weight: bold; }
+            .section { background: #202225; padding: 12px; border-radius: 8px; }
+            .section h4 { margin: 0 0 10px 0; font-size: 12px; text-transform: uppercase; color: #8e9297; }
+            button { width: 100%; padding: 10px; margin-top: 6px; border: none; border-radius: 4px; cursor: pointer; color: white; font-weight: 600; transition: 0.2s; }
             .btn-blue { background: #5865f2; } .btn-green { background: #3ba55d; } .btn-red { background: #ed4245; }
+            button:hover { filter: brightness(1.2); }
             
-            #autocomplete { position: absolute; background: #18191c; border: 1px solid #000; display: none; z-index: 100; }
-            .user-opt { padding: 5px 10px; cursor: pointer; } .user-opt:hover { background: #5865f2; }
+            #autocomplete { position: absolute; bottom: 70px; left: 20px; background: #18191c; border-radius: 4px; border: 1px solid #000; display: none; width: 200px; z-index: 100; }
+            .user-opt { padding: 8px; cursor: pointer; border-bottom: 1px solid #2f3136; }
+            .user-opt:hover { background: #5865f2; }
+            #sList { max-height: 200px; overflow-y: auto; }
         </style>
     </head>
     <body>
         <div id="side">
             <div class="section">
-                <select id="vSel"><option value="fomo">Fomo</option><option value="botspam">Botspam</option></select>
+                <h4>Voice Channels</h4>
+                <select id="vSel" style="width:100%; background:#40444b; color:white; border:none; padding:8px; border-radius:4px;">
+                    <option value="fomo">Fomo</option>
+                    <option value="botspam">Botspam</option>
+                </select>
                 <button class="btn-green" onclick="vAction('join')">Join VC</button>
                 <button class="btn-red" onclick="vAction('leave')">Leave VC</button>
-                <button class="btn-red" style="margin-top:15px;" onclick="socket.emit('stop_sounds')">🛑 STOP ALL SOUNDS</button>
+                <button class="btn-red" style="margin-top:10px" onclick="socket.emit('stop_sounds')">🛑 Stop All Audio</button>
             </div>
+
             <div class="section">
-                <input type="range" min="0" max="100" value="50" oninput="socket.emit('set_volume', {v: this.value/100})">
-                <input type="text" id="tIn" placeholder="TTS Overlay...">
-                <button class="btn-blue" onclick="sendTTS()">Speak</button>
+                <h4>Volume & TTS</h4>
+                <input type="range" min="0" max="100" value="50" style="width:100%" oninput="socket.emit('set_volume', {v: this.value/100})">
+                <input type="text" id="tIn" placeholder="TTS Message..." style="width:100%; margin-top:10px; padding:8px; background:#40444b; color:white; border:none; border-radius:4px;">
+                <button class="btn-blue" onclick="sendTTS()">Speak (Overlay)</button>
             </div>
-            <div id="sList" class="section"><strong>Sounds:</strong></div>
+
+            <div class="section">
+                <h4>Soundboard</h4>
+                <input type="file" id="soundUp" accept=".mp3" style="display:none" onchange="uploadSound()">
+                <button class="btn-blue" onclick="document.getElementById('soundUp').click()">➕ Upload New MP3</button>
+                <div id="sList" style="margin-top:10px"></div>
+            </div>
         </div>
+
         <div id="chat-wrap">
             <div id="log"></div>
-            <div style="padding: 20px; background: #40444b;">
-                <div id="autocomplete"></div>
-                <input type="file" id="chatFile" style="display:none" onchange="uploadChatImg()">
-                <button class="btn-blue" style="width:auto; padding: 5px 10px;" onclick="document.getElementById('chatFile').click()">📷</button>
-                <input type="text" id="cIn" placeholder="Message Discord..." style="width:85%; background:transparent; border:none; color:white; padding:10px;" oninput="checkMention(this)" onkeydown="if(event.key==='Enter') sendChat()">
+            <div id="autocomplete"></div>
+            <div style="padding: 15px; background: #2f3136; display: flex; gap: 10px; align-items: center;">
+                <input type="file" id="chatFile" style="display:none" onchange="sendImage()">
+                <button onclick="document.getElementById('chatFile').click()" style="width:40px; margin:0">🖼️</button>
+                <input type="text" id="cIn" placeholder="Type a message (use @ to ping)..." style="flex:1; background:#40444b; color:white; border:none; padding:12px; border-radius:8px;" oninput="checkMention(this)" onkeydown="if(event.key==='Enter') sendChat()">
             </div>
         </div>
 
@@ -142,90 +157,104 @@ def index():
                 log.scrollTop = log.scrollHeight;
             });
 
+            socket.on('history', msgs => {
+                msgs.forEach(d => {
+                    const isMe = d.is_me ? 'msg-me' : '';
+                    let html = `<div class="msg ${isMe}"><img src="${d.pfp}" class="pfp"><div class="msg-content"><b>${d.user}</b><br>${d.text}`;
+                    if(d.img) html += `<br><img src="${d.img}" class="attach-img">`;
+                    html += `</div></div>`;
+                    log.innerHTML += html;
+                });
+                log.scrollTop = log.scrollHeight;
+            });
+
             function vAction(action) { socket.emit('voice_action', {action, chan: document.getElementById('vSel').value}); }
             function sendTTS() { socket.emit('send_tts', {text: document.getElementById('tIn').value}); document.getElementById('tIn').value=''; }
-            
-            function sendChat() {
-                const i = document.getElementById('cIn');
-                socket.emit('send_chat', {text: i.value});
-                i.value = '';
+            function sendChat() { socket.emit('send_chat', {text: document.getElementById('cIn').value}); document.getElementById('cIn').value=''; }
+
+            async function uploadSound() {
+                const fd = new FormData(); fd.append('file', document.getElementById('soundUp').files[0]);
+                await fetch('/upload_sound', {method: 'POST', body: fd});
+                loadSounds();
             }
 
-            async function uploadChatImg() {
-                const fd = new FormData(); fd.append('file', document.getElementById('chatFile').click());
-                // Image handling logic here
+            async function sendImage() {
+                const fd = new FormData(); fd.append('file', document.getElementById('chatFile').files[0]);
+                await fetch('/send_img', {method: 'POST', body: fd});
             }
 
-            // Autocomplete Ping Logic
-            async function checkMention(el) {
-                const val = el.value;
-                const lastAt = val.lastIndexOf('@');
-                if(lastAt !== -1) {
-                    const query = val.substring(lastAt + 1);
-                    const res = await fetch(`/search_members?q=${query}`);
-                    const users = await res.json();
-                    const ac = document.getElementById('autocomplete');
-                    ac.innerHTML = '';
-                    if(users.length > 0) {
-                        ac.style.display = 'block';
-                        users.forEach(u => {
-                            const div = document.createElement('div');
-                            div.className = 'user-opt';
-                            div.innerText = u.name;
-                            div.onclick = () => {
-                                el.value = val.substring(0, lastAt) + '@' + u.name + ' ';
-                                ac.style.display = 'none';
-                            };
-                            ac.appendChild(div);
-                        });
-                    }
-                } else { document.getElementById('autocomplete').style.display = 'none'; }
-            }
-
-            socket.on('update_sounds', list => {
-                const div = document.getElementById('sList'); div.innerHTML = '<strong>Sounds:</strong>';
+            async function loadSounds() {
+                const res = await fetch('/list_sounds');
+                const list = await res.json();
+                const div = document.getElementById('sList'); div.innerHTML = '';
                 list.forEach(s => {
-                    const b = document.createElement('button'); b.className='btn-blue'; b.style.fontSize='10px'; b.innerText=s;
+                    const b = document.createElement('button'); b.style.background='#4f545c'; b.style.fontSize='11px'; b.innerText=s;
                     b.onclick = () => socket.emit('play_saved', {n: s});
                     div.appendChild(b);
                 });
-            });
+            }
+
+            async function checkMention(el) {
+                const lastAt = el.value.lastIndexOf('@');
+                const ac = document.getElementById('autocomplete');
+                if(lastAt !== -1) {
+                    const res = await fetch(`/search_members?q=${el.value.substring(lastAt+1)}`);
+                    const users = await res.json();
+                    ac.innerHTML = '';
+                    if(users.length){
+                        ac.style.display='block';
+                        users.forEach(u => {
+                            const d = document.createElement('div'); d.className='user-opt'; d.innerText=u.name;
+                            d.onclick = () => { el.value = el.value.substring(0, lastAt) + '@' + u.name + ' '; ac.style.display='none'; };
+                            ac.appendChild(d);
+                        });
+                    }
+                } else ac.style.display='none';
+            }
+
+            window.onload = () => { loadSounds(); socket.emit('get_history'); };
         </script>
     </body>
     </html>
     """)
 
+# --- ROUTES & HANDLERS ---
+@app.route('/upload_sound', methods=['POST'])
+def up_sound():
+    f = request.files['file']
+    path = os.path.join(UPLOAD_FOLDER, secure_filename(f.filename))
+    f.save(path); mixer.add_source(path)
+    return "OK"
+
+@app.route('/send_img', methods=['POST'])
+def send_img():
+    f = request.files['file']
+    path = secure_filename(f.filename)
+    f.save(path)
+    asyncio.run_coroutine_threadsafe(bot.get_channel(TEXT_ID).send(file=discord.File(path)), bot_loop)
+    return "OK"
+
+@app.route('/list_sounds')
+def list_sounds(): return jsonify([f for f in os.listdir(UPLOAD_FOLDER) if f.endswith('.mp3')])
+
 @app.route('/search_members')
-def search_members():
+def search_m():
     q = request.args.get('q', '').lower()
     guild = bot.get_channel(TEXT_ID).guild
-    matches = [{'name': m.display_name, 'id': m.id} for m in guild.members if q in m.display_name.lower()][:5]
-    return jsonify(matches)
+    return jsonify([{'name': m.display_name} for m in guild.members if q in m.display_name.lower()][:5])
 
-# --- SOCKETS ---
-@socketio.on('stop_sounds')
-def stop_all(): mixer.stop_all()
-
-@socketio.on('send_chat')
-def h_chat(data):
+@socketio.on('get_history')
+def send_history():
     async def task():
         chan = bot.get_channel(TEXT_ID)
-        # Find pings in text and convert them to actual mentions
-        content = data['text']
-        for member in chan.guild.members:
-            if f"@{member.display_name}" in content:
-                content = content.replace(f"@{member.display_name}", member.mention)
-        await chan.send(content)
+        h = []
+        async for m in chan.history(limit=20):
+            h.append({'user': m.author.display_name, 'pfp': str(m.author.display_avatar.url), 'text': m.content, 'img': m.attachments[0].url if m.attachments else None, 'is_me': m.author == bot.user})
+        socketio.emit('history', h[::-1])
     asyncio.run_coroutine_threadsafe(task(), bot_loop)
 
-@socketio.on('send_tts')
-def h_tts(data):
-    path = f"tts_{threading.get_ident()}.mp3"
-    gTTS(text=data['text'], lang='en').save(path)
-    mixer.add_source(path)
-
 @socketio.on('voice_action')
-def h_voice(data):
+def v_act(data):
     async def task():
         global vc_client
         if data['action'] == 'join':
@@ -234,6 +263,30 @@ def h_voice(data):
             vc_client.play(mixer)
         else: await vc_client.disconnect()
     asyncio.run_coroutine_threadsafe(task(), bot_loop)
+
+@socketio.on('send_chat')
+def s_chat(data):
+    async def task():
+        chan = bot.get_channel(TEXT_ID)
+        content = data['text']
+        for m in chan.guild.members:
+            if f"@{m.display_name}" in content: content = content.replace(f"@{m.display_name}", m.mention)
+        await chan.send(content)
+    asyncio.run_coroutine_threadsafe(task(), bot_loop)
+
+@socketio.on('send_tts')
+def s_tts(data):
+    p = f"tts_{threading.get_ident()}.mp3"
+    gTTS(text=data['text'], lang='en').save(p); mixer.add_source(p)
+
+@socketio.on('play_saved')
+def p_save(data): mixer.add_source(os.path.join(UPLOAD_FOLDER, secure_filename(data['n'])))
+
+@socketio.on('stop_sounds')
+def stop_s(): mixer.stop_all()
+
+@socketio.on('set_volume')
+def s_vol(data): global current_volume; current_volume = data['v']
 
 if __name__ == "__main__":
     threading.Thread(target=lambda: socketio.run(app, host='0.0.0.0', port=5050, allow_unsafe_werkzeug=True), daemon=True).start()
